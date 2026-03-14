@@ -19,15 +19,12 @@ TerrainBrush::TerrainBrush() : Brush() {
 }
 
 void TerrainBrush::setup_operators() {
-	height_operator = new HeightOperator();
-	texture_operator = new TextureOperator();
-	cliff_operator = new CliffOperator();
+	height_operator = new HeightOperator(this);
+	texture_operator = new TextureOperator(this);
+	cliff_operator = new CliffOperator(this);
+	cell_operator = new CellOperator(this);
 
-	height_operator->brush = this;
-	texture_operator->brush = this;
-	cliff_operator->brush = this;
-
-	terrain_operators = {height_operator, texture_operator, cliff_operator};
+	terrain_operators = {height_operator, texture_operator, cliff_operator, cell_operator};
 }
 
 void TerrainBrush::deactivate_operator(TerrainOperator* target) {
@@ -39,6 +36,7 @@ void TerrainBrush::deactivate_operator(TerrainOperator* target) {
 void TerrainBrush::activate_operator(TerrainOperator* target) {
 	if (target) {
 		target->is_active = true;
+		center_on_tile_corner = target->center_on_tile_corner;
 
 		// deactivate incompatible operators
 		for (auto* op : terrain_operators) {
@@ -147,14 +145,14 @@ void TerrainBrush::apply_begin() {
 	int height = map->terrain.height;
 	const auto& corners = map->terrain.corners;
 
-	const glm::vec2 position = get_position();
-	const int x = position.x + 1;
-	const int y = position.y + 1;
-	const QRect area = QRect(x, y, size.x / 4.f, size.y / 4.f).intersected({0, 0, width, height});
+	const glm::ivec2 pos = center_on_tile_corner ? glm::vec2(input_handler.mouse_world) - size.x / 4.f / 2.f + 1.f
+												 : glm::vec2(input_handler.mouse_world) - size.x / 4.f / 2.f + 0.5f;
+	QRect area = QRect(pos.x, pos.y, size.x / 4.f, size.y / 4.f).intersected({0, 0, width, height});
+
 	const int center_x = area.x() + area.width() * 0.5f;
 	const int center_y = area.y() + area.height() * 0.5f;
 
-	// Setup for undo/redo
+	// setup for undo/redo
 	map->world_undo.new_undo_group();
 	old_corners = map->terrain.corners;
 	old_pathing_cells_static = map->pathing_map.pathing_cells_static;
@@ -163,7 +161,7 @@ void TerrainBrush::apply_begin() {
 
 	// apply all active operators
 	for (TerrainOperator* op : terrain_operators) {
-		if (op->is_active) {
+		if (op->is_enabled()) {
 			op->apply_begin(area, center_x, center_y);
 		}
 	}
@@ -174,11 +172,10 @@ void TerrainBrush::apply(double frame_delta) {
 	int height = map->terrain.height;
 	auto& corners = map->terrain.corners;
 
-	const glm::ivec2 pos = glm::vec2(input_handler.mouse_world) - size.x / 4.f / 2.f + 1.f;
+	const glm::ivec2 pos = center_on_tile_corner ? glm::vec2(input_handler.mouse_world) - size.x / 4.f / 2.f + 1.f
+												 : glm::vec2(input_handler.mouse_world) - size.x / 4.f / 2.f + 0.5f;
 
-	const glm::vec2 position = get_position();
 	QRect area = QRect(pos.x, pos.y, size.x / 4.f, size.y / 4.f).intersected({0, 0, width, height});
-	QRect operator_area;
 	QRect updated_area = QRect(pos.x - 1, pos.y - 1, size.x / 4.f + 1, size.y / 4.f + 1).intersected({0, 0, width - 1, height - 1});
 
 	if (area.width() <= 0 || area.height() <= 0) {
@@ -195,34 +192,18 @@ void TerrainBrush::apply(double frame_delta) {
 	// Apply pathing
 	for (int i = updated_area.x(); i <= updated_area.right(); i++) {
 		for (int j = updated_area.y(); j <= updated_area.bottom(); j++) {
-			Corner& bottom_left = map->terrain.corners[i][j];
-
 			for (int k = 0; k < 4; k++) {
 				for (int l = 0; l < 4; l++) {
-					map->pathing_map.pathing_cells_static[(j * 4 + l) * map->pathing_map.width + i * 4 + k] &= ~0b01001110;
+					const size_t pathing_x = i * 4 + k;
+					const size_t pathing_y = j * 4 + l;
 
-					uint8_t mask = 0;
-					if ((bottom_left.cliff || bottom_left.romp) && !map->terrain.is_corner_ramp_entrance(i, j) && apply_cliff_pathing) {
-						mask = 0b00001010;
-					}
+					map->pathing_map.pathing_cells_static[pathing_y * map->pathing_map.width + pathing_x] &= ~0b01001110;
 
-					if (!bottom_left.cliff || (bottom_left.ramp && !bottom_left.romp)) {
-						Corner& corner = map->terrain.corners[i + k / 2][j + l / 2];
-						if (apply_tile_pathing) {
-							const int id = corner.ground_texture;
-							mask |= map->terrain.pathing_options[map->terrain.tileset_ids[id]].mask();
-						}
+					uint8_t mask =
+						map->terrain
+							.get_terrain_pathing(pathing_x, pathing_y, apply_tile_pathing, apply_cliff_pathing, apply_water_pathing);
 
-						if (corner.water && apply_water_pathing) {
-							mask |= 0b01000000;
-							if (corner.final_water_height(map->terrain.water_offset) > corner.final_ground_height() + 0.40) {
-								mask |= 0b00001010;
-							} else if (corner.final_water_height(map->terrain.water_offset) > corner.final_ground_height()) {
-								mask |= 0b00001000;
-							}
-						}
-					}
-					map->pathing_map.pathing_cells_static[(j * 4 + l) * map->pathing_map.width + i * 4 + k] |= mask;
+					map->pathing_map.pathing_cells_static[pathing_y * map->pathing_map.width + pathing_x] |= mask;
 				}
 			}
 		}
